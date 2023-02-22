@@ -62,16 +62,26 @@ class CoroutineThreadedRunner:
         result = AggregatedResult(task.name)
         futures = []
 
+        async def execute_task_in_pool(task, limit, *args, **kwargs):
+            async with limit:
+                return await task(*args, **kwargs)
+
         if isinstance(task, AsyncTask):
             tasks = []
 
+            # Use a Semaphore to limit the number of coroutine running at the same time
+            limit = asyncio.Semaphore(self.num_workers)
+
             for host in hosts:
                 new_task = task.copy()
-                tasks.append(new_task.start(host))
+                tasks.append(
+                    asyncio.create_task(
+                        execute_task_in_pool(new_task.start, limit, host)
+                    )
+                )
 
-            responses = await asyncio.gather(*tasks)
-
-            for response in responses:
+            for completed_task in asyncio.as_completed(tasks):
+                response = await completed_task
                 result[response.host.name] = response
 
         else:

@@ -126,7 +126,6 @@ class SimpleInventory:
 
 
 class SimpleInventoryAsync(SimpleInventory):
-
     async def load(self) -> Inventory:
 
         yml = ruamel.yaml.YAML(typ="safe")
