@@ -1,5 +1,7 @@
 import logging
 import traceback
+import asyncio
+
 from typing import Any, Callable, Dict, List, Optional, TYPE_CHECKING, Union, cast
 
 from nornir.core.exceptions import NornirExecutionError
@@ -180,6 +182,125 @@ class Task(object):
         Returns whether current task is a dry_run or not.
         """
         return override if override is not None else self.global_dry_run
+
+
+class AsyncTask(Task):
+    async def start(self, host: "Host") -> "MultiResult":
+        """
+        Run the task for the given host.
+
+        Arguments:
+            host (:obj:`nornir.core.inventory.Host`): Host we are operating with. Populated right
+              before calling the ``task``
+            nornir(:obj:`nornir.core.Nornir`): Populated right before calling
+              the ``task``
+
+        Returns:
+            host (:obj:`nornir.core.task.MultiResult`): Results of the task and its subtasks
+        """
+        self.host = host
+
+        if self.parent_task is not None:
+            self.processors.subtask_instance_started(self, host)
+        else:
+            self.processors.task_instance_started(self, host)
+        try:
+            logger.debug("Host %r: running task %r", self.host.name, self.name)
+
+            if asyncio.iscoroutinefunction(self.task):
+                r = await self.task(self, **self.params)
+            else:
+                r = self.task(self, **self.params)
+
+            if not isinstance(r, Result):
+                r = Result(host=host, result=r)
+
+        except NornirSubTaskError as e:
+            tb = traceback.format_exc()
+            logger.error(
+                "Host %r: task %r failed with traceback:\n%s",
+                self.host.name,
+                self.name,
+                tb,
+            )
+            r = Result(host, exception=e, result=str(e), failed=True)
+
+        except Exception as e:
+            tb = traceback.format_exc()
+            logger.error(
+                "Host %r: task %r failed with traceback:\n%s",
+                self.host.name,
+                self.name,
+                tb,
+            )
+            r = Result(host, exception=e, result=tb, failed=True)
+
+        r.name = self.name
+
+        if r.severity_level == DEFAULT_SEVERITY_LEVEL:
+            if r.failed:
+                r.severity_level = logging.ERROR
+            else:
+                r.severity_level = self.severity_level
+
+        self.results.insert(0, r)
+
+        if self.parent_task is not None:
+            self.processors.subtask_instance_completed(self, host, self.results)
+        else:
+            self.processors.task_instance_completed(self, host, self.results)
+        return self.results
+
+    async def run(self, task: Callable[..., Any], **kwargs: Any) -> "MultiResult":
+        """
+        This is a utility method to call a task from within a task. For instance:
+
+            def grouped_tasks(task):
+                task.run(my_first_task)
+                task.run(my_second_task)
+
+            nornir.run(grouped_tasks)
+
+        This method will ensure the subtask is run only for the host in the current thread.
+        """
+        if not self.host:
+            msg = (
+                "You have to call this after setting host and nornir attributes. ",
+                "You probably called this from outside a nested task",
+            )
+            raise Exception(msg)
+
+        if "severity_level" not in kwargs:
+            kwargs["severity_level"] = self.severity_level
+
+        run_task = AsyncTask(
+            task,
+            self.nornir,
+            global_dry_run=self.global_dry_run,
+            processors=self.processors,
+            parent_task=self,
+            **kwargs
+        )
+        r = await run_task.start(self.host)
+        self.results.append(r[0] if len(r) == 1 else cast("Result", r))
+
+        if r.failed:
+            # Without this we will keep running the grouped task
+            raise NornirSubTaskError(task=run_task, result=r)
+
+        return r
+
+    def copy(self) -> "AsyncTask":
+        return AsyncTask(
+            self.task,
+            self.nornir,
+            self.global_dry_run,
+            self.processors,
+            self.name,
+            self.severity_level,
+            self.parent_task,
+            **self.params
+        )
 
 
 class Result(object):

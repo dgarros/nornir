@@ -2,12 +2,14 @@ import logging
 import logging.config
 from typing import List, Optional, TYPE_CHECKING
 
+import asyncio
+
 from nornir.core.configuration import Config
 from nornir.core.inventory import Inventory
 from nornir.core.plugins.runners import RunnerPlugin
 from nornir.core.processor import Processor, Processors
 from nornir.core.state import GlobalState
-from nornir.core.task import Task
+from nornir.core.task import Task, AsyncTask
 
 if TYPE_CHECKING:
     from nornir.core.inventory import Host  # noqa: W0611
@@ -77,6 +79,95 @@ class Nornir(object):
         b = Nornir(**self.__dict__)
         b.inventory = self.inventory.filter(*args, **kwargs)
         return b
+
+    async def run_async(
+        self,
+        task,
+        raise_on_error=None,
+        on_good=True,
+        on_failed=False,
+        name: Optional[str] = None,
+        **kwargs,
+    ):
+        """
+        Run task over all the hosts in the inventory.
+
+        Arguments:
+            task (``callable``): function or callable that will be run against each device in
+              the inventory
+            raise_on_error (``bool``): Override raise_on_error behavior
+            on_good(``bool``): Whether to run or not this task on hosts marked as good
+            on_failed(``bool``): Whether to run or not this task on hosts marked as failed
+            **kwargs: additional argument to pass to ``task`` when calling it
+
+        Raises:
+            :obj:`nornir.core.exceptions.NornirExecutionError`: if at least a task fails
+              and self.config.core.raise_on_error is set to ``True``
+
+        Returns:
+            :obj:`nornir.core.task.AggregatedResult`: results of each execution
+        """
+
+        if asyncio.iscoroutinefunction(task):
+            task = AsyncTask(
+                task,
+                self,
+                global_dry_run=self.data.dry_run,
+                name=name,
+                processors=self.processors,
+                **kwargs,
+            )
+        else:
+            task = Task(
+                task,
+                self,
+                global_dry_run=self.data.dry_run,
+                name=name,
+                processors=self.processors,
+                **kwargs,
+            )
+
+        self.processors.task_started(task)
+
+        run_on = []
+        if on_good:
+            for name, host in self.inventory.hosts.items():
+                if name not in self.data.failed_hosts:
+                    run_on.append(host)
+        if on_failed:
+            for name, host in self.inventory.hosts.items():
+                if name in self.data.failed_hosts:
+                    run_on.append(host)
+
+        num_hosts = len(run_on)
+        if num_hosts:
+            logger.info(
+                "Running task %r with args %s on %d hosts",
+                task.name,
+                kwargs,
+                num_hosts,
+            )
+        else:
+            logger.warning("Task %r has not been run – 0 hosts selected", task.name)
+
+        if asyncio.iscoroutinefunction(self.runner.run):
+            result = await self.runner.run(task, run_on)
+        else:
+            result = self.runner.run(task, run_on)
+
+        raise_on_error = (
+            raise_on_error
+            if raise_on_error is not None
+            else self.config.core.raise_on_error
+        )  # noqa
+        if raise_on_error:
+            result.raise_on_error()
+        else:
+            self.data.failed_hosts.update(result.failed_hosts.keys())
+
+        self.processors.task_completed(task, result)
+
+        return result
 
     def run(
         self,
